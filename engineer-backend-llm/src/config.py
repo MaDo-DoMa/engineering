@@ -25,6 +25,8 @@ RAW_COLUMNS = ["date", "openPrice", "highPrice", "lowPrice", "closePrice", "volu
 
 TARGET_COL = "target_return"
 
+FEATURE_COLUMNS = ["log_return", "volatility_10", "close_to_sma_10", "close_to_sma_20", "volume_momentum"]
+
 def set_seed(seed: int = RANDOM_SEED):
     random.seed(seed)
     np.random.seed(seed)

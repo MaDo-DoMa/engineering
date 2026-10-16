@@ -1,8 +1,13 @@
+import joblib
 import numpy as np
 import pandas as pd
 import torch
-from typing import Tuple
-from config import SEQ_LENGTH, TEST_SIZE_DAYS, TARGET_COL
+from typing import Tuple, List
+
+from sklearn.preprocessing import StandardScaler
+
+from config import SEQ_LENGTH, TEST_SIZE_DAYS, TARGET_COL, ARTIFACTS_DIR
+
 
 def split_time_series(df: pd.DataFrame, val_size_days: int = 252) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
@@ -17,6 +22,34 @@ def split_time_series(df: pd.DataFrame, val_size_days: int = 252) -> Tuple[pd.Da
     train_df = df.iloc[:val_start].copy()
     val_df = df.iloc[val_start:test_start].copy()
     test_df = df.iloc[test_start:].copy()
+
+    return train_df, val_df, test_df
+
+def scale_datasets(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    features: List[str]
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Fits StandardScaler strictly on training data to prevent data leakage,
+    transforms all splits, and saves the scaler artifact.
+    """
+    scaler = StandardScaler()
+
+    train_df = train_df.copy()
+    val_df = val_df.copy()
+    test_df = test_df.copy()
+
+    # Fit ONLY on train_df, then transform all sets
+    train_df[features] = scaler.fit_transform(train_df[features])
+    val_df[features] = scaler.transform(val_df[features])
+    test_df[features] = scaler.transform(test_df[features])
+
+    # Save scaler for production inference in FastAPI
+    scaler_path = ARTIFACTS_DIR / "scaler.pkl"
+    joblib.dump(scaler, scaler_path)
+    print(f"Scaler saved to {scaler_path}")
 
     return train_df, val_df, test_df
 

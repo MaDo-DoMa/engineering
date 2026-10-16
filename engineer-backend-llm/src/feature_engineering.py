@@ -7,6 +7,8 @@ def add_technical_indicators(df: pd.dataframe) -> pd.DataFrame:
 
     df['log_return'] = np.log(df['closePrice'] / df['closePrice'].shift(1))
 
+    df['volatility_10'] = df['log_return'].rolling(window=10).std()
+
     df['sma_10'] = df['closePrice'].rolling(window=10).mean()
     df['sma_20'] = df['closePrice'].rolling(window=20).mean()
 
@@ -26,7 +28,7 @@ def create_target(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
+def prepare_dataset(df: pd.DataFrame) -> pd.DataFrame:
     """Main data transformation pipeline for a single ETF."""
     if 'date' in df.columns:
         df['date'] = pd.to_datetime(df['date'])
