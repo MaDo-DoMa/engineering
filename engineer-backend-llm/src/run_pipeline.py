@@ -8,8 +8,8 @@ from config import DATA_DIR, ARTIFACTS_DIR, FEATURE_COLUMNS, set_seed
 from feature_engineering import prepare_dataset
 from data_preprocessing import split_time_series, scale_datasets, prepare_tensors
 from models import LSTMPredictor, GRUPredictor
-from train_rf import train_and_save_rf
-from train_nn import train_pytorch_model
+from tune_rf import tune_and_save_rf
+from tune_nn import tune_and_save_nn
 
 
 def mean_absolute_percentage_error(y_true, y_pred):
@@ -61,18 +61,17 @@ def main():
     X_test, y_test = prepare_tensors(test_df, FEATURE_COLUMNS)
 
     print("\n5. Training Deep Learning models (PyTorch)...")
-    lstm_model = LSTMPredictor(input_size=input_size)
-    train_pytorch_model(lstm_model, X_train, y_train, X_val, y_val, "lstm_model", epochs=50)
-
-    gru_model = GRUPredictor(input_size=input_size)
-    train_pytorch_model(gru_model, X_train, y_train, X_val, y_val, "gru_model", epochs=50)
+    lstm_model = tune_and_save_nn("LSTM", X_train, y_train, X_val, y_val, n_trials=10)
+    gru_model = tune_and_save_nn("GRU", X_train, y_train, X_val, y_val, n_trials=10)
 
     print("\n6. Training Baseline model (Random Forest)...")
     X_train_rf = X_train.view(X_train.size(0), -1).numpy()
     y_train_rf = y_train.view(-1).numpy()
+    X_val_rf = X_val.view(X_val.size(0), -1).numpy()
+    y_val_rf = y_val.view(-1).numpy()
     X_test_rf = X_test.view(X_test.size(0), -1).numpy()
 
-    train_and_save_rf(X_train_rf, y_train_rf)
+    rf_model = tune_and_save_rf(X_train_rf, y_train_rf, X_val_rf, y_val_rf, n_trials=20)
 
     print("\n7. Final Evaluation on Test Set (Out-of-Sample)...")
     actuals = y_test.numpy().flatten()
@@ -83,7 +82,6 @@ def main():
         lstm_preds = lstm_model(X_test).numpy().flatten()
         gru_preds = gru_model(X_test).numpy().flatten()
 
-    rf_model = joblib.load(ARTIFACTS_DIR / "rf_model.pkl")
     rf_preds = rf_model.predict(X_test_rf)
 
     evaluate_model(actuals, lstm_preds, "LSTM")
