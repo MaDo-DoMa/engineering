@@ -17,6 +17,7 @@ Do zrobienia (integracja):
 """
 
 import datetime
+import os
 from typing import Dict, List
 
 import numpy as np
@@ -30,7 +31,7 @@ import streamlit as st
 # =====================================================================
 # TODO: PODPIĄĆ PRAWDZIWY ADRES IP BACKENDU QUARKUS <<<
 # Docelowo np.: "http://192.168.0.15:8080/api" albo "http://localhost:8080/api"
-API_BASE_URL = "http://localhost:8080/api"
+API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8080/api")
 
 # Timeouty dla zapytań HTTP (sekundy) - używane przy prawdziwym API.
 REQUEST_TIMEOUT = 10

@@ -14,7 +14,7 @@ public class EtfPriceHistory {
     private Long id;
 
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "etf_if", nullable = false)
+    @JoinColumn(name = "etf_id", nullable = false)
     private Etf etf;
 
     @Column(nullable = false)
