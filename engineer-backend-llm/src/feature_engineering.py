@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 
-def add_technical_indicators(df: pd.dataframe) -> pd.DataFrame:
+def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Adds technical indicators based on OHLCV columns."""
     df = df.copy()
 

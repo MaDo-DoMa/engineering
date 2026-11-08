@@ -1,4 +1,3 @@
-version: '3.8'
 services:
   postgres:
     image: postgres:15
@@ -22,8 +21,10 @@ services:
       - QUARKUS_DATASOURCE_JDBC_URL=jdbc:postgresql://postgres:5432/etf_db
       - QUARKUS_DATASOURCE_USERNAME=user
       - QUARKUS_DATASOURCE_PASSWORD=password
-      - TIINGO_API_KEY=${TIINGO_API_KEY}
       - ML_SERVICE_URL=http://python-ml:8000
+      # TIINGO_API_KEY intentionally NOT set here: the compose variable
+      # ${TIINGO_API_KEY} resolves to an empty string when it is missing from
+      # the shell and would clobber the real key from env_file (.env).
     depends_on:
       - postgres
 
@@ -32,6 +33,12 @@ services:
       context: ./engineer-backend-llm
     ports:
       - "8000:8000"
+    # DEV: source code is bind-mounted into the container, so code edits are
+    # visible after a simple `docker compose restart python-ml` - no rebuild
+    # and no image change required (pip deps live outside /app, so they
+    # are not shadowed by this mount).
+    volumes:
+      - ./engineer-backend-llm:/app
 
   frontend:
     build:
@@ -39,8 +46,14 @@ services:
     container_name: shop-frontend
     ports:
       - "8501:8501"
+    # DEV: source code is bind-mounted into the container, so app.py edits are
+    # visible after a simple `docker compose restart frontend` - no rebuild
+    # required (pip deps live in site-packages, not in /app).
+    volumes:
+      - ./frontend:/app
     environment:
-      - API_BASE_URL=http://java-backend:8080/api
+      - JAVA_API_BASE_URL=http://java-backend:8080
+      - ML_API_BASE_URL=http://python-ml:8000
     depends_on:
       - java-backend
       - python-ml

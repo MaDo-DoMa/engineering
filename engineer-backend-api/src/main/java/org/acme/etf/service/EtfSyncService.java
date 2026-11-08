@@ -36,9 +36,15 @@ public class EtfSyncService {
         Etf etf = etfRepository.findBySymbolOptional(symbol).orElseGet(() -> {
             Etf newEtf = new Etf();
             newEtf.setSymbol(symbol.toUpperCase());
+            newEtf.setName(TickerMapping.displayName(symbol));
             etfRepository.persist(newEtf);
             return newEtf;
         });
+
+        // Fill in the display name for ETFs created before TickerMapping existed.
+        if (etf.getName() == null || etf.getName().isBlank()) {
+            etf.setName(TickerMapping.displayName(symbol));
+        }
 
         // 2. Ustal od jakiej daty pobrać dane (żeby uniknąć duplikatów)
         LocalDate lastDate = historyRepository.findLatestDateForEtf(etf.getId());
@@ -49,9 +55,12 @@ public class EtfSyncService {
             return;
         }
 
-        // 3. Pobranie danych z zewnętrznego API
-        LOG.infof("Fetching history for %s from Tiingo starting from date: %s", symbol, startDate);
-        List<TiingoEtfPriceResponse> prices = tiingoClient.getHistoricalPrices(symbol, startDate.toString());
+        // 3. Pobranie danych z zewnętrznego API (frontend symbol -> Tiingo ticker)
+        String tiingoTicker = TickerMapping.toTiingo(symbol);
+        LOG.infof("Fetching history for %s (Tiingo: %s) starting from date: %s",
+                symbol, tiingoTicker, startDate);
+        List<TiingoEtfPriceResponse> prices =
+                tiingoClient.getHistoricalPrices(tiingoTicker, startDate.toString());
 
         // 4. Zapis nowych notowań do bazy
         for (TiingoEtfPriceResponse dto : prices) {

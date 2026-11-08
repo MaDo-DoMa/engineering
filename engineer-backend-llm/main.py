@@ -22,9 +22,9 @@ try:
         rf_path = ARTIFACTS_DIR / "rf_model.pkl"
     rf_model = joblib.load(rf_path)
     models_loaded = True
-    print("Successfully loaded RF model from {ARTIFACTS_DIR}")
+    print(f"Successfully loaded RF model from {ARTIFACTS_DIR}")
 except Exception as e:
-    print("Warning: Could not load RF model from {ARTIFACTS_DIR}. Error: {e}")
+    print(f"Warning: Could not load RF model from {ARTIFACTS_DIR}. Error: {e}")
     models_loaded = False
 
 class HistoricalRecord(BaseModel):
@@ -39,6 +39,12 @@ class PredictionRequest(BaseModel):
 class PredictionResponse(BaseModel):
     targetDate: date
     predictedClosePrice: float
+
+class EvaluateRequest(BaseModel):
+    """Payload of POST /evaluate (rolling validation for the dashboard)."""
+    history: List[HistoricalRecord]
+    n_folds: int = 3
+    test_days: int = 60
 
 
 def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -93,6 +99,38 @@ def predict(request: PredictionRequest):
     next_business_day = last_date + pd.offsets.BDay(1)
 
     return PredictionResponse(targetDate=next_business_day.date(), predictedClosePrice=round(predicted_price, 2))
+
+@app.get("/health")
+def health():
+    """Liveness/readiness probe used by the frontend status dot."""
+    return {"status": "ok", "rf_loaded": models_loaded}
+
+
+@app.post("/evaluate")
+def evaluate(request: EvaluateRequest):
+    """
+    Rolling validation over the provided price history:
+    per fold, price predictions of LSTM / GRU / Random Forest and both
+    naive baselines. Metrics (MAE/RMSE/DA) and the Diebold-Mariano test
+    are computed on the frontend from the returned arrays.
+    """
+    df = pd.DataFrame([record.model_dump() for record in request.history])
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values(by=["date"]).reset_index(drop=True)
+
+    if df["volume"].isna().any():
+        raise HTTPException(status_code=400, detail="Volume is required for every history row")
+
+    # Import lazily: keeps /predict (torch-free) alive even if torch fails.
+    from src.evaluation_service import evaluate_history
+
+    try:
+        result = evaluate_history(df, n_folds=request.n_folds, test_days=request.test_days)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return result
 
 if __name__ == '__main__':
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

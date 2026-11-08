@@ -1,7 +1,6 @@
 import os
 import random
 import numpy as np
-import torch
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -28,6 +27,10 @@ TARGET_COL = "target_return"
 FEATURE_COLUMNS = ["log_return", "volatility_10", "close_to_sma_10", "close_to_sma_20", "volume_momentum"]
 
 def set_seed(seed: int = RANDOM_SEED):
+    # torch is imported lazily: the inference container (main.py) runs on a slim
+    # image without torch; only the training scripts call set_seed().
+    import torch
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
