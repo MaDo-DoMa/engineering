@@ -1,0 +1,12 @@
+# Runtime dependencies of the FastAPI serving layer (main.py + src/evaluation_service.py).
+# Versions pinned to match the local training venv, so model artifacts and
+# predictions behave identically locally and inside the container.
+# Note: torch comes SEPARATELY in the Dockerfile from the CPU-only wheel
+# index - installing it from default PyPI would pull the CUDA stack (~3 GB).
+fastapi==0.143.3
+uvicorn==0.54.0
+pydantic==2.14.1
+numpy==2.5.4
+pandas==3.0.6
+scikit-learn==1.9.1
+joblib==1.6.0

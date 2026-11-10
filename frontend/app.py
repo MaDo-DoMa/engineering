@@ -310,7 +310,7 @@ def fetch_history(symbol: str) -> Tuple[Optional[pd.DataFrame], bool]:
         return None, False
 
 
-def evaluate_from_api(history_df: pd.DataFrame) -> Dict[int, Dict[str, pd.DataFrame]]:
+def evaluate_from_api(history_df: pd.DataFrame) -> Tuple[Dict[int, Dict[str, pd.DataFrame]], Optional[Dict]]:
     """
     Calls the ML backend rolling validation:
         POST {ML_API_BASE_URL}/evaluate
@@ -318,6 +318,9 @@ def evaluate_from_api(history_df: pd.DataFrame) -> Dict[int, Dict[str, pd.DataFr
     is converted to the same structure the mock generator produces:
         {fold: {model: DataFrame(date, actual, prev_close, prediction)}}
     Metrics and the DM test are computed on the frontend side.
+
+    Also returns the backend's "next_day" forward forecast
+    ({date, prev_close, predictions: {model: price}}) or None when absent.
     """
     payload_rows = [
         # itertuples field: row.date is a pandas Timestamp -> ISO "YYYY-MM-DD"
@@ -346,7 +349,43 @@ def evaluate_from_api(history_df: pd.DataFrame) -> Dict[int, Dict[str, pd.DataFr
             })
             for model, arr in fold["predictions"].items()
         }
-    return results
+
+    next_day = None
+    if isinstance(data.get("next_day"), dict):
+        next_day = {
+            "date": data["next_day"]["date"],
+            "prev_close": float(data["next_day"]["prev_close"]),
+            "predictions": {
+                model: float(price)
+                for model, price in data["next_day"]["predictions"].items()
+            },
+        }
+    return results, next_day
+
+
+def fetch_next_day_mock(history: pd.DataFrame) -> Dict:
+    """
+    MOCK forward forecast for the next trading day: anchored at the last
+    mock close, each model drifts by its own seeded noise so the shape
+    resembles the real ML service output.
+    """
+    last_close = float(history["close"].iloc[-1])
+    next_session = pd.bdate_range(
+        start=history["date"].iloc[-1] + pd.Timedelta(days=1), periods=1
+    )[0]
+    rng = np.random.default_rng(seed=zlib.crc32(b"next-day") % (2**32))
+    predictions: Dict[str, float] = {
+        "Zero Return": last_close,
+    }
+    train_close = history["close"].values
+    mean_return = float(np.mean(train_close[1:] / train_close[:-1] - 1.0))
+    predictions["Mean Return"] = last_close * (1.0 + mean_return)
+    for model, params in MODEL_PROFILES.items():
+        drift = rng.normal(0, params["noise"])
+        predictions[model] = last_close * (
+            1.0 + params["correlation"] * drift + params["bias"]
+        )
+    return {"date": str(pd.Timestamp(next_session).date()), "prev_close": last_close, "predictions": predictions}
 
 
 # =====================================================================
@@ -413,25 +452,29 @@ if not selected_models:
 
 
 # Peer evaluation cache per ETF (all folds are computed anyway). Returns
-# (results, mock_mode) where False means everything came from the real
-# backends (Quarkus + FastAPI) and True means the app fell back to mocks.
-@st.cache_data(show_spinner="Pobieranie danych historycznych i ocena modeli ML...")
-def run_evaluation(symbol: str) -> Tuple[Dict[int, Dict[str, pd.DataFrame]], bool]:
+# (results, next_day, mock_mode) where False means everything came from the
+# real backends (Quarkus + FastAPI) and True means the app fell back to mocks.
+# ttl keeps results fresh after the backend scheduled sync picks up new data.
+@st.cache_data(show_spinner="Pobieranie danych historycznych i ocena modeli ML...", ttl=600)
+def run_evaluation(symbol: str) -> Tuple[Dict[int, Dict[str, pd.DataFrame]], Optional[Dict], bool]:
     history, came_from_api = fetch_history(symbol)
     if came_from_api:
         try:
-            return evaluate_from_api(history), False
+            results, next_day = evaluate_from_api(history)
+            return results, next_day, False
         except Exception:
             pass  # fall through to the mock layer below
     mock_history = fetch_history_mock(symbol)
     return (
         {cfg["fold"]: fetch_predictions_mock(mock_history, cfg) for cfg in build_folds(mock_history)},
+        fetch_next_day_mock(mock_history),
         True,
     )
 
 
 # Cached history for the header panel (always renders, even in mock mode).
-@st.cache_data(show_spinner=False)
+# ttl keeps the "last trading day" numbers fresh after scheduled backend sync.
+@st.cache_data(show_spinner=False, ttl=600)
 def get_history(symbol: str) -> Tuple[pd.DataFrame, bool]:
     df, came_from_api = fetch_history(symbol)
     if df is None:
@@ -441,12 +484,14 @@ def get_history(symbol: str) -> Tuple[pd.DataFrame, bool]:
 
 # Recompute on button press: a fresh click forces a new run.
 if run_prediction or "last_run" not in st.session_state:
+    results, next_day, mock_mode = run_evaluation(selected_symbol)
     st.session_state["last_run"] = selected_symbol
-    results, mock_mode = run_evaluation(selected_symbol)
     st.session_state["results"] = results
+    st.session_state["next_day"] = next_day
     st.session_state["mock_mode"] = mock_mode
 
 results = st.session_state["results"]
+next_day = st.session_state.get("next_day")
 mock_mode = st.session_state.get("mock_mode", False)
 metrics_by_fold = evaluate_all_folds(results)
 
@@ -475,13 +520,20 @@ else:
     st.success("🟢 Dane z backendu: historia - Quarkus (Tiingo), predykcje - inferencja modeli ML.")
 
 st.header(f"Analiza: {etf_labels[active_symbol]}")
+st.caption(
+    "ℹ️ Wszystkie ceny to ceny JEDNEJ AKCJI ETF (dane Tiingo), a nie poziomy indeksów giełdowych: "
+    "ETF SPY kosztuje ok. 1/10 poziomu indeksu S&P 500. WIG20 jest aproksymowany ETF-em EPOL "
+    "(iShares MSCI Poland) - GPW nie ma pokrycia w Tiingo."
+)
 
-info_col1, info_col2, info_col3, info_col4 = st.columns(4)
+info_col1, info_col2, info_col3, info_col4, info_col5 = st.columns(5)
 info_col1.metric("Pełna nazwa", etf_labels[active_symbol].rsplit(" (", 1)[0])
 info_col2.metric(
     "Aktualna cena",
     f"{last_price:,.2f} USD",
-    help="Ostatnia zamknięta sesja (mock w trybie MOCK, inaczej dane z Tiingo).",
+    help="Cena JEDNEJ AKCJI ETF z ostatniej zamkniętej sesji (Tiingo), nie poziom indeksu. "
+         "Np. SPY jest zaprojektowany tak, że jego cena ≈ 1/10 poziomu indeksu S&P 500 "
+         "(indeks ~7 500 pkt -> SPY ~750 USD). To akcję ETF prognozują modele.",
 )
 info_col3.metric(
     "Zwrot - ostatnie 12 mies.",
@@ -494,6 +546,18 @@ info_col4.metric(
     help="Zmiana ceny na CAŁEJ dostępnej historii z Tiingo, "
          "dlatego dla długich ETF-ów (np. GLD z 2004 r.) są to wysokie wartości.",
 )
+if next_day:
+    ml_forecasts = [next_day["predictions"][m] for m in ML_MODELS if m in next_day["predictions"]]
+    forecast_detail = "; ".join(
+        f"{m}: {next_day['predictions'].get(m, float('nan')):,.2f} USD" for m in ML_MODELS
+    )
+    info_col5.metric(
+        f"Prognoza na {next_day['date']}",
+        f"{np.mean(ml_forecasts):,.2f} USD",
+        delta=f"{(np.mean(ml_forecasts) / next_day['prev_close'] - 1) * 100:+.2f}% vs zamknięcie",
+        help=f"Średnia prognoza modeli ML na najbliższą sesję. Szczegóły: {forecast_detail}. "
+             "Punkty diamentowe na wykresie głównym pokazują prognozę każdego modelu osobno.",
+    )
 
 st.divider()
 
@@ -502,7 +566,13 @@ st.subheader(f"Cena rzeczywista vs. predykcje modeli (fold {selected_fold})")
 st.caption(
     "Na wykresach pokazujemy wyłącznie modele ML (LSTM, GRU, Random Forest). "
     "Modele bazowe (Zero Return, Mean Return) porównujemy w tabelach metryk "
-    "i na wykresach słupkowych - nie wnoszą wartości wizualnej." )
+    "i na wykresach słupkowych - nie wnoszą wartości wizualnej. "
+    + (
+        f"Progi prognozy na następną sesję ({next_day['date']}) widoczne są dla ostatniego foldu "
+        "jako przerywane przedłużenia z diamentem."
+        if next_day else ""
+    )
+)
 
 # Chart-only model selection (kept in st.session_state via the widget key,
 # so the choice survives reruns and does not affect tables/metrics).
@@ -560,6 +630,30 @@ for model in drawn_models:
             hovertemplate=f"Model: {model}<br>Data: %{{x|%Y-%m-%d}}<br>Predykcja: %{{y:.2f}} USD<extra></extra>",
         )
     )
+
+# Forward forecast (next trading day) drawn ONLY on the last fold - it is
+# anchored at that fold's final prediction, so stitching it to older folds
+# would draw a misleading jump across the test-window gap.
+if next_day and selected_fold == N_FOLDS:
+    fwd_ts = pd.Timestamp(next_day["date"])
+    for model in drawn_models:
+        if model not in next_day["predictions"]:
+            continue
+        pred_df = fold_data[model]
+        fig.add_trace(
+            go.Scatter(
+                x=[pred_df["date"].iloc[-1], fwd_ts],
+                y=[pred_df["prediction"].iloc[-1], next_day["predictions"][model]],
+                mode="lines+markers",
+                marker=dict(size=10, symbol="diamond"),
+                line=dict(dash="dot", width=2, color=MODEL_COLORS.get(model, "#9467bd")),
+                name=f"Prognoza {next_day['date']}: {model}",
+                hovertemplate=(
+                    f"Prognoza na {next_day['date']}<br>Model: {model}"
+                    "<br>Cena: %{y:.2f} USD<extra></extra>"
+                ),
+            )
+        )
 
 if not drawn_models:
     fig.add_annotation(

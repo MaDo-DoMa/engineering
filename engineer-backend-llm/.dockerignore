@@ -1,0 +1,10 @@
+# Never send the local dev environment to the Docker build context.
+# The .venv alone is ~1,2 GB - this alone caused very slow builds.
+.venv/
+.idea/
+__pycache__/
+**/__pycache__/
+*.pyc
+.git/
+.gitignore
+*.md
