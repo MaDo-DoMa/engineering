@@ -25,7 +25,7 @@ def objective(trial, X_train, y_train, X_val, y_val):
     #Minimalize MSE in validation set
     return mean_squared_error(y_val, prediction)
 
-def tune_and_save_rf(X_train, y_train, X_val, y_val, n_trials=20):
+def tune_and_save_rf(X_train, y_train, X_val, y_val, n_trials=20, ticker=None):
     print(f"tuning random forest")
     study = optuna.create_study(direction="minimize")
     study.optimize(lambda trial: objective(trial, X_train, y_train, X_val, y_val), n_trials=n_trials)
@@ -43,7 +43,10 @@ def tune_and_save_rf(X_train, y_train, X_val, y_val, n_trials=20):
     )
     best_rf.fit(X_train, y_train)
 
-    model_path=ARTIFACTS_DIR / "rf_model_optimized.pkl"
+    if ticker:
+        model_path = ARTIFACTS_DIR / f"{ticker.lower()}_rf_model_optimized.pkl"
+    else:
+        model_path = ARTIFACTS_DIR / "rf_model_optimized.pkl"
     joblib.dump(best_rf, model_path)
     print(f"Optimized model saved at "+ str(model_path))
 

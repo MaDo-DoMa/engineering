@@ -4,7 +4,6 @@ import java.util.Map;
 
 /**
  * Static mapping between frontend-facing symbols and real Tiingo tickers.
- *
  * The database/REST layer ALWAYS uses the frontend symbol as the canonical
  * identifier (SPY500, NASDAQ, ...), so the frontend can keep sending
  * human-readable names. Only the outgoing Tiingo HTTP request is mapped.
@@ -30,10 +29,6 @@ public final class TickerMapping {
             "INVESCO", "RSP"
     );
 
-    /**
-     * frontendSymbol -> full, human-readable fund name persisted in the
-     * "etfs.name" column (used by GET /api/etfs and any UI listing).
-     */
     private static final Map<String, String> DISPLAY_NAMES = Map.of(
             "SPY500", "SPDR S&P 500 ETF Trust",
             "NASDAQ", "Invesco QQQ Trust (Nasdaq-100)",

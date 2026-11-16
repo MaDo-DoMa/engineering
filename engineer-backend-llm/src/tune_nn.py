@@ -76,7 +76,7 @@ def objective(trial, model_type, X_train, y_train, X_val, y_val):
 
     return best_val_loss
 
-def tune_and_save_nn(model_type, X_train, y_train, X_val, y_val, n_trials=10):
+def tune_and_save_nn(model_type, X_train, y_train, X_val, y_val, n_trials=10, ticker=None):
     print(f"\n--- Starting Optuna Optimization for {model_type} ---")
 
     study = optuna.create_study(direction="minimize")
@@ -112,7 +112,12 @@ def tune_and_save_nn(model_type, X_train, y_train, X_val, y_val, n_trials=10):
             loss.backward()
             optimizer.step()
 
-    model_path = ARTIFACTS_DIR / f"{model_type.lower()}_model_optimized.pt"
+    # Per-instrument filename: multi-ticker runs must not overwrite each
+    # other's weights (the served /evaluate picks artifacts by ticker).
+    if ticker:
+        model_path = ARTIFACTS_DIR / f"{ticker.lower()}_{model_type.lower()}_model_optimized.pt"
+    else:
+        model_path = ARTIFACTS_DIR / f"{model_type.lower()}_model_optimized.pt"
     torch.save(best_model.state_dict(), model_path)
     print(f"Optimized {model_type} saved at {model_path}")
 

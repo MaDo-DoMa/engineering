@@ -1,18 +1,17 @@
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 from datetime import date
 import pandas as pd
 import uvicorn
 import joblib
 from pathlib import Path
 
-from src.config import ARTIFACTS_DIR, FEATURE_COLUMNS
+from src.config import FEATURE_COLUMNS
 
 app = FastAPI(title="ML ETF Prediction Service", version="1.0.0")
 
-ARTIFACTS_DIR = Path("data/articles")
 FEATURES_DIR = ['log_return', 'volatility_10', 'close_to_sma_10', 'close_to_sma_20', 'volume_momentum']
 
 try:
@@ -45,6 +44,9 @@ class EvaluateRequest(BaseModel):
     history: List[HistoricalRecord]
     n_folds: int = 3
     test_days: int = 60
+    # Frontend symbol ("SPY500", ...) - picks per-ticker artifacts
+    # ({ticker}_scaler.pkl, ...); falls back to the legacy shared pack.
+    ticker: Optional[str] = None
 
 
 def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -125,7 +127,8 @@ def evaluate(request: EvaluateRequest):
     from src.evaluation_service import evaluate_history
 
     try:
-        result = evaluate_history(df, n_folds=request.n_folds, test_days=request.test_days)
+        result = evaluate_history(df, n_folds=request.n_folds, test_days=request.test_days,
+                                  ticker=request.ticker)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     except ValueError as exc:

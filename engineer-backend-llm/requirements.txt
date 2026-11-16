@@ -10,3 +10,5 @@ numpy==2.5.4
 pandas==3.0.6
 scikit-learn==1.9.1
 joblib==1.6.0
+# Needed by run_pipeline.py (per-ticker retraining); the serving layer works without it.
+optuna==4.5.0

@@ -2,17 +2,24 @@ services:
   postgres:
     image: postgres:15
     container_name: shop-postgres
+    restart: unless-stopped
     environment:
       POSTGRES_USER: user
       POSTGRES_PASSWORD: password
       POSTGRES_DB: etf_db
     ports:
       - "5432:5432"
+    # Named volume: Tiingo price history SURVIVES `docker compose down`,
+    # container recreation and Docker Desktop restarts. (Anonymous container
+    # storage was the cause of the recurring empty-database incidents.)
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
 
   java-backend:
     build:
       context: ./engineer-backend-api
       dockerfile: src/main/docker/Dockerfile.jvm
+    restart: unless-stopped
     ports:
       - "8080:8080"
     env_file:
@@ -31,6 +38,7 @@ services:
   python-ml:
     build:
       context: ./engineer-backend-llm
+    restart: unless-stopped
     ports:
       - "8000:8000"
     # DEV: source code is bind-mounted into the container, so code edits are
@@ -43,6 +51,7 @@ services:
   frontend:
     build:
       context: ./frontend
+    restart: unless-stopped
     container_name: shop-frontend
     ports:
       - "8501:8501"
@@ -57,3 +66,22 @@ services:
     depends_on:
       - java-backend
       - python-ml
+
+  # One-shot service: prints the startup banner with working links once
+  # every service answers. Runs automatically with `docker compose up -d`
+  # (visible via `docker compose logs banner`), or in the FOREGROUND via
+  # `docker compose run --rm banner` / the provided `up.ps1` helper.
+  banner:
+    image: curlimages/curl:8.10.1
+    container_name: shop-banner
+    depends_on:
+      - frontend
+      - java-backend
+      - python-ml
+    restart: "no"
+    volumes:
+      - ./ops/banner.sh:/banner.sh:ro
+    entrypoint: ["sh", "/banner.sh"]
+
+volumes:
+  postgres_data:

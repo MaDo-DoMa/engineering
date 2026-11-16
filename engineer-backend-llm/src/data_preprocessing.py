@@ -29,11 +29,16 @@ def scale_datasets(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     test_df: pd.DataFrame,
-    features: List[str]
+     features: List[str],
+    ticker: str = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Fits StandardScaler strictly on training data to prevent data leakage,
     transforms all splits, and saves the scaler artifact.
+
+    With `ticker` set, the scaler is saved per instrument
+    ("{ticker}_scaler.pkl") so multi-ticker runs never overwrite each
+    other's weights/scalers; without it the legacy "scaler.pkl" is kept.
     """
     scaler = StandardScaler()
 
@@ -46,8 +51,11 @@ def scale_datasets(
     val_df[features] = scaler.transform(val_df[features])
     test_df[features] = scaler.transform(test_df[features])
 
-    # Save scaler for production inference in FastAPI
-    scaler_path = ARTIFACTS_DIR / "scaler.pkl"
+    # Save scaler for production inference in FastAPI (per-ticker when given)
+    if ticker:
+        scaler_path = ARTIFACTS_DIR / f"{ticker.lower()}_scaler.pkl"
+    else:
+        scaler_path = ARTIFACTS_DIR / "scaler.pkl"
     joblib.dump(scaler, scaler_path)
     print(f"Scaler saved to {scaler_path}")
 

@@ -1,3 +1,5 @@
+import sys
+
 import pandas as pd
 import numpy as np
 import torch
@@ -5,8 +7,9 @@ import joblib
 import scipy.stats as stats
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
+from predict_kalman import KalmanFilterModel
 
-from config import DATA_DIR, ARTIFACTS_DIR, FEATURE_COLUMNS, set_seed
+from config import DATA_DIR, FEATURE_COLUMNS, set_seed
 from feature_engineering import prepare_dataset
 from data_preprocessing import scale_datasets, prepare_tensors
 from tune_rf import tune_and_save_rf
@@ -22,9 +25,9 @@ def evaluate_model(y_true, y_pred, model_name):
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     da = directional_accuracy(y_true, y_pred)
 
-    print(f"--- Results for {model_name} ---")
-    print(f"MAE:  ${mae:.5f}")
-    print(f"RMSE: ${rmse:.5f}")
+    print(f"--- Results for {model_name} (log-return space) ---")
+    print(f"MAE:  {mae:.5f}")
+    print(f"RMSE: {rmse:.5f}")
     print(f"DA:   {da:.2f}%")
     return mae, rmse, da
 
@@ -72,7 +75,7 @@ def process_etf(ticker):
         val_df = train_val_df.iloc[-val_size:].copy()
 
         train_df, val_df, test_df = scale_datasets(
-            train_df, val_df, test_df, FEATURE_COLUMNS
+            train_df, val_df, test_df, FEATURE_COLUMNS, ticker=ticker
         )
 
         X_train, y_train = prepare_tensors(train_df, FEATURE_COLUMNS)
@@ -80,9 +83,8 @@ def process_etf(ticker):
         X_test, y_test = prepare_tensors(test_df, FEATURE_COLUMNS)
 
         print(f"\n--- Tuning Deep Learning models for {ticker} (Fold {fold+1}) ---")
-        # Save models with ticker prefix to avoid overwriting
-        lstm_model = tune_and_save_nn(f"LSTM_{ticker}", X_train, y_train, X_val, y_val, n_trials=5)
-        gru_model = tune_and_save_nn(f"GRU_{ticker}", X_train, y_train, X_val, y_val, n_trials=5)
+        lstm_model = tune_and_save_nn("LSTM", X_train, y_train, X_val, y_val, n_trials=5, ticker=ticker)
+        gru_model = tune_and_save_nn("GRU", X_train, y_train, X_val, y_val, n_trials=5, ticker=ticker)
 
         print(f"\n--- Tuning Baseline model (Random Forest) for {ticker} (Fold {fold+1}) ---")
         X_train_rf = X_train.view(X_train.size(0), -1).numpy()
@@ -91,10 +93,11 @@ def process_etf(ticker):
         y_val_rf = y_val.view(-1).numpy()
         X_test_rf = X_test.view(X_test.size(0), -1).numpy()
 
-        rf_model = tune_and_save_rf(X_train_rf, y_train_rf, X_val_rf, y_val_rf, n_trials=10)
+        rf_model = tune_and_save_rf(X_train_rf, y_train_rf, X_val_rf, y_val_rf, n_trials=10, ticker=ticker)
 
         print(f"\n--- Final Evaluation for {ticker} - Fold {fold+1} ---")
         actuals = y_test.numpy().flatten()
+
 
         lstm_model.eval()
         gru_model.eval()
@@ -103,6 +106,10 @@ def process_etf(ticker):
             gru_preds = gru_model(X_test).numpy().flatten()
 
         rf_preds = rf_model.predict(X_test_rf)
+
+        kalman_model = KalmanFilterModel(process_var=1e-4, measurement_var=1e-2)
+        kalman_model.fit(y_train_rf)
+        kalman_preds = kalman_model.predict(actuals)
 
         baseline_zero = np.zeros_like(actuals)
         baseline_mean = np.full_like(actuals, y_train_rf.mean())
@@ -115,6 +122,7 @@ def process_etf(ticker):
         evaluate_model(actuals, lstm_preds, "LSTM")
         evaluate_model(actuals, gru_preds, "GRU")
         evaluate_model(actuals, rf_preds, "Random Forest")
+        evaluate_model(actuals, kalman_preds, "Kalman Filter")
 
         print("\nDiebold-Mariano Tests (p-value < 0.05 indicates statistically significant difference):")
         _, p_val_rf_lstm = dm_test(actuals, rf_preds, lstm_preds)
@@ -125,8 +133,9 @@ def process_etf(ticker):
 def main():
     set_seed()
 
-    # Target list of instruments for the experiment
-    etfs = ["NASDAQ", "SPY500", "WIG20", "INVESCO", "GLD"]
+    # Target list of instruments for the experiment. Optional CLI args allow
+    # retraining a subset (or a single instrument): python run_pipeline.py SPY500
+    etfs = sys.argv[1:] or ["NASDAQ", "SPY500", "WIG20", "INVESCO", "GLD"]
 
     for ticker in etfs:
         print(f"\n" + "="*50)

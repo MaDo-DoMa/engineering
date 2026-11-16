@@ -19,7 +19,7 @@ Current state of the code:
 
 Methodology (consistent with the backend):
     - Rolling validation with 3 folds (like TimeSeriesSplit).
-    - Models: LSTM, GRU, Random Forest + 2 baselines:
+    - Models: LSTM, GRU, Random Forest, Kalman Filter + 2 baselines:
         * Zero Return (naive: tomorrow's price equals today's),
         * Mean Return (prediction = today's price * (1 + mean historical return)).
     - Dollar metrics: MAE ($), RMSE ($) and Directional Accuracy (%).
@@ -36,6 +36,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import requests
 import streamlit as st
 
@@ -70,7 +71,7 @@ AVAILABLE_ETFS: List[Dict[str, str]] = [
 ]
 
 # ML models available in the system - must match the backend.
-ML_MODELS: List[str] = ["LSTM", "GRU", "Random Forest"]
+ML_MODELS: List[str] = ["LSTM", "GRU", "Random Forest", "Kalman Filter"]
 
 # Baseline models - reference points for the ML models.
 BASELINE_MODELS: List[str] = ["Zero Return", "Mean Return"]
@@ -90,6 +91,9 @@ MODEL_PROFILES: Dict[str, Dict[str, float]] = {
     "Random Forest": {"correlation": 0.55, "bias": -0.0002, "noise": 0.004},
     "LSTM":          {"correlation": 0.70, "bias": 0.0001, "noise": 0.002},
     "GRU":           {"correlation": 0.63, "bias": 0.0,    "noise": 0.003},
+    # Kalman filter predicts a SMOOTHED constant return -> weak day-to-day
+    # correlation but very stable (low noise), like the real filter.
+    "Kalman Filter": {"correlation": 0.20, "bias": 0.0,    "noise": 0.0008},
 }
 
 # Chart colors per model.
@@ -97,6 +101,7 @@ MODEL_COLORS: Dict[str, str] = {
     "LSTM": "#2ca02c",
     "GRU": "#ff7f0e",
     "Random Forest": "#d62728",
+    "Kalman Filter": "#17becf",
     "Zero Return": "#7f7f7f",
     "Mean Return": "#9467bd",
 }
@@ -243,6 +248,46 @@ def evaluate_all_folds(results: Dict[int, Dict[str, pd.DataFrame]]) -> Dict[int,
     return {fold: evaluate_fold(preds) for fold, preds in results.items()}
 
 
+def binomial_da_test(results: Dict[int, Dict[str, pd.DataFrame]]) -> pd.DataFrame:
+    """
+    Binomial test of Directional Accuracy against the share of UP days.
+
+    "Always up" (Mean Return) is the real benchmark: Zero Return has
+    DA = 0% by definition and 50% is wrong when the market has an upward
+    bias. For every ML model we pool all folds and test
+        H0: P(correct) = p0 (share of days the price actually rose)
+    one-sided P(X >= k), X ~ Binom(n, p0), computed exactly (math.comb).
+    """
+    models = [m for m in ML_MODELS if any(m in preds for preds in results.values())]
+    rows = []
+    for model in models:
+        correct = up_days = total = 0
+        for preds in results.values():
+            if model not in preds:
+                continue
+            dfp = preds[model]
+            actual_up = dfp["actual"].values > dfp["prev_close"].values
+            pred_up = dfp["prediction"].values > dfp["prev_close"].values
+            correct += int(np.sum(actual_up == pred_up))
+            up_days += int(np.sum(actual_up))
+            total += len(dfp)
+        if total == 0:
+            continue
+        p0 = up_days / total  # benchmark: "always up" hit rate
+        k = correct
+        pval = sum(
+            math.comb(total, i) * (p0 ** i) * ((1 - p0) ** (total - i))
+            for i in range(k, total + 1)
+        )
+        rows.append({
+            "Model": model,
+            "Trafione kierunki (k/n)": f"{k}/{total}",
+            "Udział dni wzrostowych p0": f"{p0 * 100:.1f}%",
+            "p-value (dwumianowy)": round(min(1.0, float(pval)), 4),
+        })
+    return pd.DataFrame(rows).set_index("Model")
+
+
 def compute_dm_pvalues(results: Dict[int, Dict[str, pd.DataFrame]]) -> pd.DataFrame:
     """
     Diebold-Mariano test for each pair and fold + mean p-value
@@ -310,7 +355,7 @@ def fetch_history(symbol: str) -> Tuple[Optional[pd.DataFrame], bool]:
         return None, False
 
 
-def evaluate_from_api(history_df: pd.DataFrame) -> Tuple[Dict[int, Dict[str, pd.DataFrame]], Optional[Dict]]:
+def evaluate_from_api(history_df: pd.DataFrame, symbol: str = "") -> Tuple[Dict[int, Dict[str, pd.DataFrame]], Optional[Dict]]:
     """
     Calls the ML backend rolling validation:
         POST {ML_API_BASE_URL}/evaluate
@@ -331,7 +376,9 @@ def evaluate_from_api(history_df: pd.DataFrame) -> Tuple[Dict[int, Dict[str, pd.
 
     response = requests.post(
         f"{ML_API_BASE_URL}/evaluate",
-        json={"history": payload_rows, "n_folds": N_FOLDS, "test_days": TEST_DAYS},
+        json={"history": payload_rows, "n_folds": N_FOLDS, "test_days": TEST_DAYS,
+              # symbol -> per-ticker artifacts ({ticker}_scaler.pkl, ...) in the ML backend
+              "ticker": symbol or None},
         timeout=ML_EVALUATE_TIMEOUT,
     )
     response.raise_for_status()
@@ -460,7 +507,7 @@ def run_evaluation(symbol: str) -> Tuple[Dict[int, Dict[str, pd.DataFrame]], Opt
     history, came_from_api = fetch_history(symbol)
     if came_from_api:
         try:
-            results, next_day = evaluate_from_api(history)
+            results, next_day = evaluate_from_api(history, symbol)
             return results, next_day, False
         except Exception:
             pass  # fall through to the mock layer below
@@ -564,7 +611,7 @@ st.divider()
 # ============ Section 2: price vs. predictions chart =================
 st.subheader(f"Cena rzeczywista vs. predykcje modeli (fold {selected_fold})")
 st.caption(
-    "Na wykresach pokazujemy wyłącznie modele ML (LSTM, GRU, Random Forest). "
+    "Na wykresach pokazujemy wyłącznie modele predykcyjne (LSTM, GRU, Random Forest, Kalman Filter). "
     "Modele bazowe (Zero Return, Mean Return) porównujemy w tabelach metryk "
     "i na wykresach słupkowych - nie wnoszą wartości wizualnej. "
     + (
@@ -747,31 +794,39 @@ st.plotly_chart(fig_err_time, use_container_width=True, config={"scrollZoom": Tr
 
 # --- Row 3: error distribution histogram (ML models only - the naive
 #     baselines create huge symmetric saturating blocks) ------------------
-st.markdown("###### Rozkład błędów (histogram)")
+# One subplot per model (small multiples): overlaying translucent histograms
+# on a single axis was unreadable - shapes covered each other completely.
+st.markdown("###### Rozkład błędów (histogram) - każdy model w osobnym panelu")
 
-fig_hist = go.Figure()
-for model in ML_MODELS:
+fig_hist = make_subplots(
+    rows=len(ML_MODELS),
+    cols=1,
+    shared_xaxes=True,
+    subplot_titles=[f"{model}" for model in ML_MODELS],
+    vertical_spacing=0.05,
+)
+for row, model in enumerate(ML_MODELS, start=1):
     err = fold_data[model]["actual"].values - fold_data[model]["prediction"].values
     fig_hist.add_trace(
         go.Histogram(
             x=err,
             name=model,
-            opacity=0.65,
             marker_color=MODEL_COLORS.get(model, "#9467bd"),
             hovertemplate="Zakres błędu: %{x}<br>Liczba obserwacji: %{y}<extra></extra>",
             nbinsx=25,
-        )
+            showlegend=False,
+        ),
+        row=row,
+        col=1,
     )
-fig_hist.add_vline(x=0, line=dict(color="black", width=1, dash="dot"))
+    fig_hist.add_vline(x=0, line=dict(color="black", width=1, dash="dot"), row=row, col=1)
 fig_hist.update_layout(
-    height=360,
+    height=250 * len(ML_MODELS),
     template="plotly_white",
-    barmode="overlay",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
     margin=dict(l=20, r=20, t=30, b=20),
-    xaxis=dict(title="Błąd predykcji (USD)"),
-    yaxis=dict(title="Liczba dni"),
 )
+fig_hist.update_xaxes(title_text="Błąd predykcji (USD)", row=len(ML_MODELS), col=1)
+fig_hist.update_yaxes(title_text="Liczba dni", col=1)
 st.plotly_chart(fig_hist, use_container_width=True)
 
 st.divider()
@@ -804,6 +859,28 @@ summary_df = summary_df.rename(columns={
 })
 st.markdown("###### Podsumowanie - średnia ze wszystkich foldów")
 st.dataframe(summary_df, use_container_width=True)
+
+# Methodology notes - honest limitations, useful for the thesis text.
+st.caption(
+    "Metodologia walidacji: **3 stałe okna testowe po 60 sesji** (kolejne w czasie), "
+    "przy oknie sekwencji SEQ=20 ocenianych jest **40 punktów na fold**. "
+    "Wagi modeli są **statyczne** (jeden trening) - foldy to trzy okna oceny tego "
+    "samego modelu, nie pełny walk-forward z retreningiem. Kalman Filter to "
+    "wygładzona średnia zwrotów (spodziewanie zbliżony do Mean Return), "
+    "a strojenie Optuną (5 prób) i wybór hiperparametrów na jednym wycinku "
+    "walidacyjnym (20%) są niestabilne - ograniczenie PoC."
+)
+
+# Binomial DA test - the real benchmark is the share of UP days (Mean Return
+# is "always up"; Zero Return has DA = 0% by definition, 50% is a bad reference).
+st.markdown("###### Test dwumianowy DA - czy model trafia kierunek częściej niż „zawsze wzrost”?")
+st.caption(
+    "Dwumianowy test jednostronny P(X ≥ k), X ~ Binom(n, p0), gdzie k/n = łączne "
+    "trafienia kierunku we wszystkich foldach, a p0 = udział dni wzrostowych "
+    "(trafność benchmarku „zawsze wzrost” = Mean Return). p < 0.05 oznacza "
+    "istotną przewagę kierunkową nad benchmarkiem."
+)
+st.dataframe(binomial_da_test(results), use_container_width=True)
 
 st.divider()
 
