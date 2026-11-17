@@ -7,9 +7,10 @@ import joblib
 import scipy.stats as stats
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
-from predict_kalman import KalmanFilterModel
+from sklearn.preprocessing import StandardScaler
+from predict_kalman import KalmanFilterModel, tune_kalman_params
 
-from config import DATA_DIR, FEATURE_COLUMNS, set_seed
+from config import ARTIFACTS_DIR, DATA_DIR, FEATURE_COLUMNS, set_seed
 from feature_engineering import prepare_dataset
 from data_preprocessing import scale_datasets, prepare_tensors
 from tune_rf import tune_and_save_rf
@@ -82,9 +83,28 @@ def process_etf(ticker):
         X_val, y_val = prepare_tensors(val_df, FEATURE_COLUMNS)
         X_test, y_test = prepare_tensors(test_df, FEATURE_COLUMNS)
 
+        # Standardize the TARGET for the neural networks. Daily log returns
+        # live at a ~0.01 scale, so with a raw target the output bias needs
+        # far more gradient steps than early stopping allows to even reach
+        # the training mean - the served nets carried a frozen ~+0.003/day
+        # bias (a training artifact, not a learned "Mean Return"). Fit on
+        # TRAIN only and save the artifact so serving inverts it
+        # ({ticker}_yscaler.pkl). Random Forest keeps the raw target: trees
+        # are invariant to monotone rescaling of the target.
+        y_scaler = StandardScaler()
+        y_train_s = torch.tensor(
+            y_scaler.fit_transform(y_train.view(-1, 1).numpy()), dtype=torch.float32
+        )
+        y_val_s = torch.tensor(
+            y_scaler.transform(y_val.view(-1, 1).numpy()), dtype=torch.float32
+        )
+        yscaler_path = ARTIFACTS_DIR / f"{ticker.lower()}_yscaler.pkl"
+        joblib.dump(y_scaler, yscaler_path)
+        print(f"Target scaler saved to {yscaler_path}")
+
         print(f"\n--- Tuning Deep Learning models for {ticker} (Fold {fold+1}) ---")
-        lstm_model = tune_and_save_nn("LSTM", X_train, y_train, X_val, y_val, n_trials=5, ticker=ticker)
-        gru_model = tune_and_save_nn("GRU", X_train, y_train, X_val, y_val, n_trials=5, ticker=ticker)
+        lstm_model = tune_and_save_nn("LSTM", X_train, y_train_s, X_val, y_val_s, n_trials=5, ticker=ticker)
+        gru_model = tune_and_save_nn("GRU", X_train, y_train_s, X_val, y_val_s, n_trials=5, ticker=ticker)
 
         print(f"\n--- Tuning Baseline model (Random Forest) for {ticker} (Fold {fold+1}) ---")
         X_train_rf = X_train.view(X_train.size(0), -1).numpy()
@@ -105,11 +125,24 @@ def process_etf(ticker):
             lstm_preds = lstm_model(X_test).numpy().flatten()
             gru_preds = gru_model(X_test).numpy().flatten()
 
+        # NN predictions are in the STANDARDIZED target space - map back to
+        # raw log returns before any metric (baselines/RF/Kalman are raw).
+        lstm_preds = y_scaler.inverse_transform(lstm_preds.reshape(-1, 1)).ravel()
+        gru_preds = y_scaler.inverse_transform(gru_preds.reshape(-1, 1)).ravel()
+
         rf_preds = rf_model.predict(X_test_rf)
 
-        kalman_model = KalmanFilterModel(process_var=1e-4, measurement_var=1e-2)
+        # Kalman filter: hyperparameters estimated from the training fold
+        # only (R = variance of training returns, Q = grid search on the
+        # last 20% of the training segment), then fit on the training
+        # returns - no test data is touched during tuning or fitting.
+        kalman_q, kalman_r = tune_kalman_params(y_train_rf)
+        kalman_model = KalmanFilterModel(
+            process_var=kalman_q, measurement_var=kalman_r
+        )
         kalman_model.fit(y_train_rf)
         kalman_preds = kalman_model.predict(actuals)
+        print(f"Kalman params (train-only): Q={kalman_q:g}, R={kalman_r:g}")
 
         baseline_zero = np.zeros_like(actuals)
         baseline_mean = np.full_like(actuals, y_train_rf.mean())

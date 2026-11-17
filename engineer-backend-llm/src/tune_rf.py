@@ -27,7 +27,11 @@ def objective(trial, X_train, y_train, X_val, y_val):
 
 def tune_and_save_rf(X_train, y_train, X_val, y_val, n_trials=20, ticker=None):
     print(f"tuning random forest")
-    study = optuna.create_study(direction="minimize")
+    # Seeded sampler: without it the trial sequence (and thus the saved
+    # artifacts) would not be reproducible.
+    study = optuna.create_study(
+        direction="minimize", sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED)
+    )
     study.optimize(lambda trial: objective(trial, X_train, y_train, X_val, y_val), n_trials=n_trials)
 
     print(f"\nOptimization finished")

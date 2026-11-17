@@ -8,23 +8,14 @@ import uvicorn
 import joblib
 from pathlib import Path
 
-from src.config import FEATURE_COLUMNS
+from src.config import ARTIFACTS_DIR, FEATURE_COLUMNS
 
 app = FastAPI(title="ML ETF Prediction Service", version="1.0.0")
 
 FEATURES_DIR = ['log_return', 'volatility_10', 'close_to_sma_10', 'close_to_sma_20', 'volume_momentum']
 
-try:
-    scaler = joblib.load(ARTIFACTS_DIR / "scaler.pkl")
-    rf_path = ARTIFACTS_DIR / "rf_model_optimized.pkl"
-    if not rf_path.exists():
-        rf_path = ARTIFACTS_DIR / "rf_model.pkl"
-    rf_model = joblib.load(rf_path)
-    models_loaded = True
-    print(f"Successfully loaded RF model from {ARTIFACTS_DIR}")
-except Exception as e:
-    print(f"Warning: Could not load RF model from {ARTIFACTS_DIR}. Error: {e}")
-    models_loaded = False
+# RF serving artifacts are resolved PER TICKER inside /predict (strict,
+# no legacy shared-artifact fallback); nothing is loaded eagerly any more.
 
 class HistoricalRecord(BaseModel):
     date: date
@@ -34,7 +25,6 @@ class HistoricalRecord(BaseModel):
 class PredictionRequest(BaseModel):
     symbol: str
     history: List[HistoricalRecord]
-
 class PredictionResponse(BaseModel):
     targetDate: date
     predictedClosePrice: float
@@ -44,8 +34,8 @@ class EvaluateRequest(BaseModel):
     history: List[HistoricalRecord]
     n_folds: int = 3
     test_days: int = 60
-    # Frontend symbol ("SPY500", ...) - picks per-ticker artifacts
-    # ({ticker}_scaler.pkl, ...); falls back to the legacy shared pack.
+    # Frontend symbol ("SPY500", ...) - selects the strict per-ticker
+    # artifact pack ({ticker}_scaler.pkl, ...); requests without it fail.
     ticker: Optional[str] = None
 
 
@@ -67,11 +57,26 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
 
 @app.post("/predict", response_model=PredictionResponse)
 def predict(request: PredictionRequest):
-    if not models_loaded:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-
+    """
+    Single next-day RF forecast. Artifacts are resolved strictly per
+    ticker ({symbol}_scaler.pkl, {symbol}_rf_model_optimized.pkl) - the
+    legacy shared pack is no longer accepted.
+    """
     if not request.history or len(request.history) < 20:
         raise HTTPException(status_code=400, detail="Not enough history data")
+
+    ticker = (request.symbol or "").lower()
+    scaler_path = ARTIFACTS_DIR / f"{ticker}_scaler.pkl"
+    rf_path = ARTIFACTS_DIR / f"{ticker}_rf_model_optimized.pkl"
+    missing = [str(p) for p in (scaler_path, rf_path) if not p.exists()]
+    if missing:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Missing per-ticker artifacts for {request.symbol}: "
+                   + ", ".join(missing),
+        )
+    scaler = joblib.load(scaler_path)
+    rf_model = joblib.load(rf_path)
 
     #Converting payload to DataFrame
     data = [record.model_dump() for record in request.history]
@@ -105,7 +110,7 @@ def predict(request: PredictionRequest):
 @app.get("/health")
 def health():
     """Liveness/readiness probe used by the frontend status dot."""
-    return {"status": "ok", "rf_loaded": models_loaded}
+    return {"status": "ok", "artifacts": "per-ticker (strict)"}
 
 
 @app.post("/evaluate")

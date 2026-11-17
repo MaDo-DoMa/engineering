@@ -15,11 +15,10 @@ Semantics (matching the training pipeline):
         predicted_price = prev_close * exp(predicted_log_return)
 
 Known limitation (documented on purpose):
-  the artifacts were trained once with a scaler fitted on the training
-  part of the final fold. In production all folds are evaluated with this
-  single production scaler - consistent with the /predict endpoint - and
-  NO per-fold refit happens (retraining per fold would be too expensive
-  for an interactive demo).
+  the artifacts are trained once per ticker (static weights, no walk-
+  forward retraining) and every fold is evaluated with this single
+  pack - consistent with the /predict endpoint. Retraining per fold
+  would be too expensive for an interactive demo.
 """
 
 import sys
@@ -43,15 +42,16 @@ from config import ARTIFACTS_DIR, FEATURE_COLUMNS, SEQ_LENGTH
 from data_preprocessing import create_sequences
 from feature_engineering import prepare_dataset
 from models import GRUPredictor, LSTMPredictor
-from predict_kalman import KalmanFilterModel
+from predict_kalman import KalmanFilterModel, tune_kalman_params
 
 # Hyperparameters of the saved NN checkpoints are inferred from the state
 # dict at load time (see _infer_nn_architecture), so retraining with new
 # Optuna-best params does not require touching this file.
 
-# Kalman filter hyperparameters - same as the training pipeline uses.
-KALMAN_PROCESS_VAR = 1e-4
-KALMAN_MEASUREMENT_VAR = 1e-2
+# Kalman filter hyperparameters are NOT hardcoded any more: both Q and R
+# are estimated from the training segment only (see tune_kalman_params) -
+# R from the variance of training returns, Q by a grid search on the last
+# 20% of the training data (same protocol as the RF/NN tuning).
 
 ML_MODELS_SERVED: List[str] = ["LSTM", "GRU", "Random Forest", "Kalman Filter"]
 BASELINE_MODELS_SERVED: List[str] = ["Zero Return", "Mean Return"]
@@ -81,29 +81,31 @@ def _infer_nn_architecture(state_dict: Dict) -> Dict[str, int]:
 
 def _resolve_paths(ticker: Optional[str]) -> Dict[str, Path]:
     """
-    Per-ticker artifact filenames ({ticker}_scaler.pkl, ...) with a
-    graceful fallback to the legacy shared names ("scaler.pkl", ...) when
-    ticker-specific artifacts have not been trained yet.
+    Strict per-ticker artifact resolution: {ticker}_scaler.pkl,
+    {ticker}_rf_model_optimized.pkl, ... The legacy shared-artifact
+    fallback is DISABLED on purpose - serving wrong (another ticker's)
+    weights silently would be worse than failing loudly.
     """
-    if ticker:
-        prefix = ticker.lower()
-        preferred = {
-            "scaler": ARTIFACTS_DIR / f"{prefix}_scaler.pkl",
-            "rf": ARTIFACTS_DIR / f"{prefix}_rf_model_optimized.pkl",
-            "lstm": ARTIFACTS_DIR / f"{prefix}_lstm_model_optimized.pt",
-            "gru": ARTIFACTS_DIR / f"{prefix}_gru_model_optimized.pt",
-        }
-        if all(p.exists() for p in preferred.values()):
-            return preferred
-    rf_path = ARTIFACTS_DIR / "rf_model_optimized.pkl"
-    if not rf_path.exists():
-        rf_path = ARTIFACTS_DIR / "rf_model.pkl"
-    return {
-        "scaler": ARTIFACTS_DIR / "scaler.pkl",
-        "rf": rf_path,
-        "lstm": ARTIFACTS_DIR / "lstm_model_optimized.pt",
-        "gru": ARTIFACTS_DIR / "gru_model_optimized.pt",
+    if not ticker:
+        raise RuntimeError(
+            "Missing 'ticker' in the request - every evaluation must name "
+            "the instrument whose artifacts should be served."
+        )
+    prefix = ticker.lower()
+    paths = {
+        "scaler": ARTIFACTS_DIR / f"{prefix}_scaler.pkl",
+        "rf": ARTIFACTS_DIR / f"{prefix}_rf_model_optimized.pkl",
+        "lstm": ARTIFACTS_DIR / f"{prefix}_lstm_model_optimized.pt",
+        "gru": ARTIFACTS_DIR / f"{prefix}_gru_model_optimized.pt",
     }
+    missing = [str(p) for p in paths.values() if not p.exists()]
+    if missing:
+        raise RuntimeError(
+            f"Missing per-ticker artifacts for {ticker}: {', '.join(missing)}. "
+            "Retrain this instrument first (python run_pipeline.py "
+            f"{ticker})."
+        )
+    return paths
 
 
 def _load_pack(ticker: Optional[str] = None) -> Dict:
@@ -120,6 +122,12 @@ def _load_pack(ticker: Optional[str] = None) -> Dict:
     scaler = joblib.load(paths["scaler"])
     rf_model = joblib.load(paths["rf"])
 
+    # Optional: standardized-target scaler from training (only present for
+    # per-ticker packs retrained with target standardization). When missing,
+    # NN outputs are assumed to be in raw log-return space (legacy artifacts).
+    yscaler_path = ARTIFACTS_DIR / f"{cache_key}_yscaler.pkl"
+    y_scaler = joblib.load(yscaler_path) if yscaler_path.exists() else None
+
     arch = _infer_nn_architecture(torch.load(paths["lstm"], map_location="cpu"))
     lstm_model = LSTMPredictor(**arch)
     lstm_model.load_state_dict(torch.load(paths["lstm"], map_location="cpu"))
@@ -131,19 +139,10 @@ def _load_pack(ticker: Optional[str] = None) -> Dict:
     gru_model.eval()
 
     pack = {"scaler": scaler, "rf": rf_model, "lstm": lstm_model, "gru": gru_model,
-            "per_ticker": bool(ticker) and all(
-                (ARTIFACTS_DIR / f"{(ticker or '').lower()}_{suffix}").exists()
-                for suffix in ["scaler.pkl", "rf_model_optimized.pkl",
-                               "lstm_model_optimized.pt", "gru_model_optimized.pt"])
+            "yscaler": y_scaler,
             }
     _packs[cache_key] = pack
     return pack
-
-
-def _infer_seq_windows(test_feats: np.ndarray, test_targets: np.ndarray) -> torch.Tensor:
-    """Builds the sliding-window tensor for the test slice only (pipeline semantics)."""
-    X_windows, _ = create_sequences(test_feats, test_targets, SEQ_LENGTH)
-    return X_windows
 
 
 def evaluate_history(df_raw: pd.DataFrame, n_folds: int = 3, test_days: int = 60,
@@ -190,18 +189,32 @@ def evaluate_history(df_raw: pd.DataFrame, n_folds: int = 3, test_days: int = 60
                 "Not enough history data: need roughly "
                 f"{(n_folds + 1) * test_days + SEQ_LENGTH + 60} rows, got {len(df_raw)}."
             )
-        rows_predicted = test_days - SEQ_LENGTH
-        if rows_predicted <= 0:
-            raise ValueError(f"test_days must exceed seq_length ({SEQ_LENGTH}).")
+        # Feature rows BEFORE test_start are already known at evaluation time,
+        # so they are used as sliding-window context: every one of the 60 test
+        # sessions is evaluated (nothing is lost to the SEQ_LENGTH warm-up).
+        # No leakage: every window ends before its own anchor day.
+        rows_predicted = test_days
 
-        train_slice = df.iloc[:test_start]
-        test_slice = df.iloc[test_start:test_end]
-        mean_train_return = float(train_slice["target_return"].mean())
+        # Anchor r (df index) predicts the return close[r] -> close[r+1];
+        # we evaluate r in [test_start-1, test_end-2] so all actual closes
+        # fall inside the test window.
+        row_idx = np.arange(test_start - 1, test_end - 1)  # df indices r
 
-        # Production scaler (fitted once during training) for both splits.
-        train_feats = pack["scaler"].transform(train_slice[FEATURE_COLUMNS])
-        test_feats = pack["scaler"].transform(test_slice[FEATURE_COLUMNS])
-        X_windows = _infer_seq_windows(test_feats, test_slice["target_return"].values)
+        # Only returns up to close[test_start-1] (target rows ..test_start-2)
+        # are "past" relative to the first anchor - the baseline constant and
+        # the Kalman fit must not see the first evaluated day's return.
+        past_returns = df["target_return"].values[: test_start - 1]
+        mean_train_return = float(past_returns.mean())
+
+        # Sliding windows over ALL feature rows up to test_end; window i
+        # covers rows [i, i+SEQ) and anchors r = i+SEQ, so we take windows
+        # i in [test_start-1-SEQ, test_end-2-SEQ] -> exactly test_days windows.
+        ctx_feats = pack["scaler"].transform(df.iloc[:test_end][FEATURE_COLUMNS])
+        X_all, _ = create_sequences(
+            ctx_feats, df["target_return"].values, SEQ_LENGTH
+        )
+        i0 = test_start - 1 - SEQ_LENGTH
+        X_windows = X_all[i0: i0 + test_days]
 
         # ML predictions in RETURN space (raw log return, as trained).
         with torch.no_grad():
@@ -209,20 +222,35 @@ def evaluate_history(df_raw: pd.DataFrame, n_folds: int = 3, test_days: int = 60
             gru_returns = pack["gru"](X_windows).numpy().flatten()
         rf_returns = pack["rf"].predict(X_windows.view(len(X_windows), -1).numpy())
 
-        # Kalman filter: same contract as the training pipeline. Fits on the
-        # fold's training log returns, then predicts ONLINE over the test
-        # anchors - prediction i is emitted BEFORE the filter sees the
-        # i-th actual return, so there is no lookahead.
-        kalman = KalmanFilterModel(
-            process_var=KALMAN_PROCESS_VAR, measurement_var=KALMAN_MEASUREMENT_VAR
-        ).fit(train_slice["target_return"].values)
-        anchor_actual_returns = test_slice["target_return"].values[SEQ_LENGTH:]
-        kalman_returns = kalman.predict(anchor_actual_returns)
+        # The saved NNs were trained on a STANDARDIZED target when a
+        # {ticker}_yscaler.pkl artifact exists - map their output back to
+        # raw log-return space before any metric or price conversion.
+        if pack.get("yscaler") is not None:
+            lstm_returns = pack["yscaler"].inverse_transform(
+                lstm_returns.reshape(-1, 1)
+            ).ravel()
+            gru_returns = pack["yscaler"].inverse_transform(
+                gru_returns.reshape(-1, 1)
+            ).ravel()
 
-        # df rows involved in the predictions. Window j in the test slice
-        # covers rows [test_start+j, test_start+j+SEQ) and predicts the
-        # return from close[test_start+j+SEQ] to the NEXT session close.
-        row_idx = np.arange(test_start + SEQ_LENGTH, test_end)  # df indices r
+        # Kalman filter: hyperparameters estimated from the PAST only
+        # (R = variance of past returns, Q = grid search on the last 20%
+        # of the past segment), then the filter is fit on those same past
+        # returns and predicts ONLINE over the test anchors - prediction i
+        # is emitted BEFORE the filter sees the i-th actual return, so
+        # there is no lookahead. Refitting per fold on the (expanding)
+        # past keeps the state warm: by fold 2 and 3 the filter has
+        # already digested every earlier test session's returns.
+        kalman_q, kalman_r = tune_kalman_params(past_returns)
+        kalman = KalmanFilterModel(
+            process_var=kalman_q, measurement_var=kalman_r
+        ).fit(past_returns)
+        anchor_actual_returns = df["target_return"].values[test_start - 1: test_end - 1]
+        kalman_returns = kalman.predict(anchor_actual_returns)
+        print(f"[fold {fold + 1}] Kalman params (train-only): Q={kalman_q:g}, R={kalman_r:g}")
+
+        # df rows involved in the predictions. Window j ends at row
+        # test_start-1+j and predicts the return from close[r] to close[r+1].
         prev_close = close_raw[warmup + row_idx]                # close[r]
         actual_close = close_raw[warmup + row_idx + 1]          # close[r+1]
         dates = dates_raw[warmup + row_idx + 1]                 # day of the actual close
@@ -243,6 +271,7 @@ def evaluate_history(df_raw: pd.DataFrame, n_folds: int = 3, test_days: int = 60
 
         fold_results.append({
             "fold": fold + 1,
+            "kalman_params": {"Q": kalman_q, "R": kalman_r},
             "dates": [str(pd.Timestamp(d).date()) for d in dates],
             "actual": actual_close.tolist(),
             "prev_close": prev_close.tolist(),
@@ -277,10 +306,12 @@ def evaluate_history(df_raw: pd.DataFrame, n_folds: int = 3, test_days: int = 60
         lstm_ret = float(pack["lstm"](fwd_window).numpy().flatten()[0])
         gru_ret = float(pack["gru"](fwd_window).numpy().flatten()[0])
     rf_ret = float(pack["rf"].predict(fwd_window.view(len(fwd_window), -1).numpy())[0])
-    # Kalman forecast for the next session: fit on ALL observed log returns
-    # and take the posterior mean (no future measurement to update with).
+    # Kalman forecast for the next session: hyperparameters again estimated
+    # from the observed history only; fit on ALL observed log returns and
+    # take the posterior mean (no future measurement to update with).
+    fwd_q, fwd_r = tune_kalman_params(df["target_return"].values)
     kalman_global = KalmanFilterModel(
-        process_var=KALMAN_PROCESS_VAR, measurement_var=KALMAN_MEASUREMENT_VAR
+        process_var=fwd_q, measurement_var=fwd_r
     ).fit(df["target_return"].values)
     kalman_ret = float(kalman_global.post_mean)
     last_close = float(close_raw[last_raw_idx])
@@ -288,6 +319,7 @@ def evaluate_history(df_raw: pd.DataFrame, n_folds: int = 3, test_days: int = 60
 
     next_day = {
         "date": str(pd.Timestamp(next_session).date()),
+        "kalman_params": {"Q": fwd_q, "R": fwd_r},
         "prev_close": last_close,
         "predictions": {
             "LSTM": float(last_close * math.exp(lstm_ret)),

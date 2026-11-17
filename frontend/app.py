@@ -23,7 +23,9 @@ Methodology (consistent with the backend):
         * Zero Return (naive: tomorrow's price equals today's),
         * Mean Return (prediction = today's price * (1 + mean historical return)).
     - Dollar metrics: MAE ($), RMSE ($) and Directional Accuracy (%).
-    - Diebold-Mariano test (squared errors): RF vs LSTM and RF vs GRU.
+    - Diebold-Mariano test (squared errors) computed once on the pooled
+      180 test observations: every ML model vs both naive baselines
+      (primary) plus ML-vs-ML pairs (secondary).
 """
 
 import datetime
@@ -283,42 +285,48 @@ def binomial_da_test(results: Dict[int, Dict[str, pd.DataFrame]]) -> pd.DataFram
             "Model": model,
             "Trafione kierunki (k/n)": f"{k}/{total}",
             "Udział dni wzrostowych p0": f"{p0 * 100:.1f}%",
-            "p-value (dwumianowy)": round(min(1.0, float(pval)), 4),
+            "p-value (dwumianowy, jednostronny)": round(min(1.0, float(pval)), 4),
         })
     return pd.DataFrame(rows).set_index("Model")
 
 
 def compute_dm_pvalues(results: Dict[int, Dict[str, pd.DataFrame]]) -> pd.DataFrame:
     """
-    Diebold-Mariano test for each pair and fold + mean p-value
-    (averaging over folds as a simple summary).
+    Diebold-Mariano test on squared errors, computed ONCE on the pooled
+    loss differences (all folds concatenated, 180 observations) - per-fold
+    p-values are NOT averaged, which would be statistically meaningless.
 
-    Pairs include ML-vs-ML comparisons and ML-vs-naive-baseline ones -
-    the latter are the key academic proof that the ML models beat the
-    naive "price unchanged" assumption.
+    Primary comparisons: every ML model vs every naive baseline (Zero
+    Return, Mean Return) - the key academic question is whether the ML
+    models beat the naive assumptions at all. ML-vs-ML pairs are kept for
+    completeness but ranked after the baseline ones.
     """
-    pairs = [
-        ("Random Forest", "LSTM"),
-        ("Random Forest", "GRU"),
-        ("Zero Return", "LSTM"),
-        ("Zero Return", "Random Forest"),
-    ]
+    ml = [m for m in ML_MODELS if any(m in preds for preds in results.values())]
+    baselines = [b for b in BASELINE_MODELS
+                 if any(b in preds for preds in results.values())]
+    pairs = [(m, b) for m in ml for b in baselines]          # primary
+    pairs += [(m1, m2) for i, m1 in enumerate(ml)            # secondary
+              for m2 in ml[i + 1:]]
     rows = []
     for model1, model2 in pairs:
-        stats, pvals = [], []
-        for fold, preds in results.items():
-            pred1 = preds[model1]["prediction"].values
-            pred2 = preds[model2]["prediction"].values
-            actual = preds[model1]["actual"].values
-            stat, pval = dm_test(actual, pred1, pred2)
-            stats.append(stat)
-            pvals.append(pval)
+        per_fold_stat = []
+        actuals, preds1, preds2 = [], [], []
+        for fold, preds in sorted(results.items()):
+            actuals.append(preds[model1]["actual"].values)
+            preds1.append(preds[model1]["prediction"].values)
+            preds2.append(preds[model2]["prediction"].values)
+            stat, _ = dm_test(actuals[-1], preds1[-1], preds2[-1])
+            per_fold_stat.append(stat)
+        # One pooled DM test on all loss differences (n = 180).
+        stat, pval = dm_test(
+            np.concatenate(actuals), np.concatenate(preds1), np.concatenate(preds2)
+        )
         rows.append({
             "Porównanie": f"{model1} vs {model2}",  # displayed on screen - kept in Polish
-            "Fold 1": pvals[0],
-            "Fold 2": pvals[1],
-            "Fold 3": pvals[2],
-            "p-value (śr.)": float(np.mean(pvals)),
+            "Typ": "z baseline'em" if model2 in baselines else "model vs model",
+            "DM M (łącznie)": stat,
+            "p-value (łącznie, n=180)": pval,
+            **{f"M fold {f}": s for f, s in zip(sorted(results), per_fold_stat)},
         })
     return pd.DataFrame(rows).set_index("Porównanie")
 
@@ -477,7 +485,7 @@ with st.sidebar:
         "Okres testowy (fold):",
         options=list(range(1, N_FOLDS + 1)),
         index=N_FOLDS - 1,
-        help="Walidacja krocząca - wykres cen i błędy w czasie pokazywane dla wybranego foldu.",
+        help="Ocena poza próbą (out-of-sample) - wykres cen i błędy w czasie pokazywane dla wybranego foldu.",
     )
 
     # Action button - defines when predictions are recomputed.
@@ -568,9 +576,8 @@ else:
 
 st.header(f"Analiza: {etf_labels[active_symbol]}")
 st.caption(
-    "ℹ️ Wszystkie ceny to ceny JEDNEJ AKCJI ETF (dane Tiingo), a nie poziomy indeksów giełdowych: "
-    "ETF SPY kosztuje ok. 1/10 poziomu indeksu S&P 500. WIG20 jest aproksymowany ETF-em EPOL "
-    "(iShares MSCI Poland) - GPW nie ma pokrycia w Tiingo."
+    "Ceny to jedna akcja ETF (Tiingo), nie poziom indeksu. WIG20 = proxy EPOL "
+    "(GPW nie ma w Tiingo), notowany w USD - metryki WIG20 są w USD."
 )
 
 info_col1, info_col2, info_col3, info_col4, info_col5 = st.columns(5)
@@ -611,12 +618,11 @@ st.divider()
 # ============ Section 2: price vs. predictions chart =================
 st.subheader(f"Cena rzeczywista vs. predykcje modeli (fold {selected_fold})")
 st.caption(
-    "Na wykresach pokazujemy wyłącznie modele predykcyjne (LSTM, GRU, Random Forest, Kalman Filter). "
-    "Modele bazowe (Zero Return, Mean Return) porównujemy w tabelach metryk "
-    "i na wykresach słupkowych - nie wnoszą wartości wizualnej. "
+    "Na wykresach tylko modele predykcyjne; baseline'y porównujemy w tabelach "
+    "i słupkach."
     + (
-        f"Progi prognozy na następną sesję ({next_day['date']}) widoczne są dla ostatniego foldu "
-        "jako przerywane przedłużenia z diamentem."
+        f" Prognoza na następną sesję ({next_day['date']}) = przerywane "
+        "przedłużenie z diamentem (fold 3)."
         if next_day else ""
     )
 )
@@ -723,14 +729,16 @@ st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
 st.divider()
 
 # ================== Section 3: ERROR CHARTS ==========================
-st.subheader(f"Wykresy błędów (fold {selected_fold})")
+st.subheader(f"Wykresy błędów - {etf_labels[active_symbol]} (fold {selected_fold})")
 
 # --- Row 1: bar-chart model comparison (MAE / RMSE / DA) -------------
-def metric_bar_chart(metric: str, unit_hint: str) -> go.Figure:
+def metric_bar_chart(metric: str, unit_hint: str, exclude: list = None) -> go.Figure:
     """Bar chart: one metric, x = model, colors follow MODEL_COLORS."""
+    shown = [m for m in selected_models if m not in (exclude or [])]
     rows = [{"Model": model, metric: metrics_by_fold[selected_fold].loc[model, metric]}
-            for model in selected_models]
+            for model in shown]
     df = pd.DataFrame(rows)
+    note = f", bez: {', '.join(exclude)}" if exclude else ""
     bar_fig = px.bar(
         df,
         x="Model",
@@ -738,7 +746,7 @@ def metric_bar_chart(metric: str, unit_hint: str) -> go.Figure:
         color="Model",
         color_discrete_map=MODEL_COLORS,
         text_auto=".3f",
-        title=f"{metric} per model (fold {selected_fold})",
+        title=f"{metric} per model - {active_symbol} (fold {selected_fold}{note})",
     )
     bar_fig.update_layout(
         height=340,
@@ -759,7 +767,7 @@ with bar_col2:
     rmse_chart = metric_bar_chart("RMSE ($)", "USD")
     st.plotly_chart(rmse_chart, use_container_width=True)
 with bar_col3:
-    da_chart = metric_bar_chart("DA (%)", "%")
+    da_chart = metric_bar_chart("DA (%)", "%", exclude=["Zero Return"])
     st.plotly_chart(da_chart, use_container_width=True)
 
 # --- Row 2: error over time for the ML models (baselines excluded - they
@@ -781,12 +789,20 @@ for model in ML_MODELS:
         )
     )
 fig_err_time.add_hline(y=0, line=dict(color="black", width=1, dash="dot"))
+# Force the x-axis to hug the data: plotly's autorange with a rangeslider
+# sometimes padded the axis ~a month before the first fold observation.
+_err_dates = pd.to_datetime(pd.concat([fold_data[m]["date"] for m in ML_MODELS]))
 fig_err_time.update_layout(
     height=360,
     template="plotly_white",
     legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
     margin=dict(l=20, r=20, t=30, b=20),
-    xaxis=dict(title="Data", rangeslider=dict(visible=True)),
+    xaxis=dict(
+        title="Data",
+        range=[_err_dates.min() - pd.Timedelta(days=1),
+               _err_dates.max() + pd.Timedelta(days=1)],
+        rangeslider=dict(visible=True),
+    ),
     yaxis=dict(title="Błąd (USD)"),
     hovermode="x unified",
 )
@@ -832,19 +848,21 @@ st.plotly_chart(fig_hist, use_container_width=True)
 st.divider()
 
 # =========== Section 4: METRICS TABLE (per fold + summary) ===========
-st.subheader(f"Metryki błędu z walidacji (fold {selected_fold})")
+st.subheader(f"Metryki błędu poza próbą (test) - {etf_labels[active_symbol]} (fold {selected_fold})")
 
 fold_metrics = metrics_by_fold[selected_fold].loc[selected_models].copy()
 fold_metrics["DA (%)"] = fold_metrics["DA (%)"].map(lambda v: f"{v:.2f}%")
 fold_metrics["MAE ($)"] = fold_metrics["MAE ($)"].map(lambda v: f"{v:,.2f}")
 fold_metrics["RMSE ($)"] = fold_metrics["RMSE ($)"].map(lambda v: f"{v:,.2f}")
+# Zero Return never calls a direction, so its DA = 0% by convention - show
+# a dash instead of a misleading "0.00%".
+if "Zero Return" in fold_metrics.index:
+    fold_metrics.loc["Zero Return", "DA (%)"] = "—"
 st.dataframe(fold_metrics, use_container_width=True)
 
 st.caption(
-    "MAE ($) - średni błąd bezwzględny ceny | RMSE ($) - pierwiastek błędu średniokwadratowego, "
-    "silniej karze duże błędy | DA (%) - trafność kierunku (wzrost/spadek) względem dnia poprzedniego. "
-    "Uwaga: **Zero Return** zawsze przewiduje brak zmiany, więc nie obstawia żadnego kierunku - "
-    "stąd jego DA = 0% (konwencja zgodna z backendem)."
+    "MAE (\\$) - średni błąd ceny | RMSE (\\$) - silniej karze duże błędy | "
+    "DA (%) - trafność kierunku. **Zero Return** nie obstawia kierunku - DA „—”."
 )
 
 # Summary - mean across all folds (rolling validation).
@@ -852,6 +870,8 @@ summary_df = pd.concat(metrics_by_fold.values()).groupby(level="Model").mean().l
 summary_df["DA (%)"] = summary_df["DA (%)"].map(lambda v: f"{v:.2f}%")
 summary_df["MAE ($)"] = summary_df["MAE ($)"].map(lambda v: f"{v:,.2f}")
 summary_df["RMSE ($)"] = summary_df["RMSE ($)"].map(lambda v: f"{v:,.2f}")
+if "Zero Return" in summary_df.index:
+    summary_df.loc["Zero Return", "DA (%)"] = "—"
 summary_df = summary_df.rename(columns={
     "MAE ($)": "MAE - średnia ($) (3 foldy)",
     "RMSE ($)": "RMSE - średnia ($) (3 foldy)",
@@ -862,23 +882,21 @@ st.dataframe(summary_df, use_container_width=True)
 
 # Methodology notes - honest limitations, useful for the thesis text.
 st.caption(
-    "Metodologia walidacji: **3 stałe okna testowe po 60 sesji** (kolejne w czasie), "
-    "przy oknie sekwencji SEQ=20 ocenianych jest **40 punktów na fold**. "
-    "Wagi modeli są **statyczne** (jeden trening) - foldy to trzy okna oceny tego "
-    "samego modelu, nie pełny walk-forward z retreningiem. Kalman Filter to "
-    "wygładzona średnia zwrotów (spodziewanie zbliżony do Mean Return), "
-    "a strojenie Optuną (5 prób) i wybór hiperparametrów na jednym wycinku "
-    "walidacyjnym (20%) są niestabilne - ograniczenie PoC."
+    "Ocena **poza próbą**: 3 okna testowe po 60 sesji (180 łącznie), każda "
+    "prognoza bez wycieku (okno kończy się przed swoim dniem). To **nie "
+    "walidacja** - tą jest 20% wycinek treningowy (strojenie Optuną). Wagi "
+    "**statyczne** (bez retreningu per fold); sieci na standaryzowanej "
+    "zmiennej celu, RF i Kalman na surowych zwrotach; parametry Kalmana (Q, "
+    "R) estymowane tylko na train. Ograniczenia PoC: 5 cech technicznych, "
+    "5 prób Optuny, niska moc testów przy n = 180, WIG20 = proxy EPOL (USD)."
 )
 
 # Binomial DA test - the real benchmark is the share of UP days (Mean Return
 # is "always up"; Zero Return has DA = 0% by definition, 50% is a bad reference).
 st.markdown("###### Test dwumianowy DA - czy model trafia kierunek częściej niż „zawsze wzrost”?")
 st.caption(
-    "Dwumianowy test jednostronny P(X ≥ k), X ~ Binom(n, p0), gdzie k/n = łączne "
-    "trafienia kierunku we wszystkich foldach, a p0 = udział dni wzrostowych "
-    "(trafność benchmarku „zawsze wzrost” = Mean Return). p < 0.05 oznacza "
-    "istotną przewagę kierunkową nad benchmarkiem."
+    "Test jednostronny P(X ≥ k), X ~ Binom(180, p0); p0 = udział dni wzrostowych "
+    "(benchmark „zawsze wzrost”). p < 0.05 = istotna przewaga kierunkowa."
 )
 st.dataframe(binomial_da_test(results), use_container_width=True)
 
@@ -887,35 +905,16 @@ st.divider()
 # ========= Section 5: STATISTICAL TESTS (Diebold-Mariano) ============
 st.subheader("🧪 Testy statystyczne - Diebold-Mariano")
 st.caption(
-    "Test porównuje jakość predykcji obu modeli (błędy kwadratowe). "
-    "**p-value < 0.05** oznacza, że różnica między modelami jest istotna "
-    "statystycznie, a nie przypadkowa. Pary z baseline'em *Zero Return* to "
-    "ostateczny dowód, że modele ML istotnie przewyższają naiwne "
-    "założenie niezmienności ceny."
+    "DM na błędach kwadratowych, policzony **raz na łącznych 180 obserwacjach** "
+    "(bez uśredniania p-value po foldach). p < 0.05 = istotna różnica; kluczowe "
+    "są pary z baseline'ami. Przy n = 180 moc testu jest niska."
 )
 
-dm_table = compute_dm_pvalues(results)
-
-for pair_name, row in dm_table.iterrows():
-    p_avg = row["p-value (śr.)"]
-    significant = p_avg < 0.05
-    with st.container(border=True):
-        c1, c2, c3 = st.columns([3, 1, 2])
-        with c1:
-            st.markdown(f"**Porównanie: {pair_name}**")
-        with c2:
-            st.metric("p-value (śr.)", f"{p_avg:.5f}")
-        with c3:
-            if significant:
-                st.success("✅ Różnica istotna statystycznie (p < 0.05)")
-            else:
-                st.info("ℹ️ Brak istotności statystycznej (p ≥ 0.05)")
-
-        # Per-fold breakdown shown as a small helper table.
-        fold_cols = ["Fold 1", "Fold 2", "Fold 3"]
-        fold_view = pd.DataFrame({col: [f"{row[col]:.5f}"] for col in fold_cols},
-                                 index=["p-value"])
-        st.dataframe(fold_view, use_container_width=True)
+dm_table = compute_dm_pvalues(results).copy()
+dm_table["Istotna (p < 0.05)"] = np.where(
+    dm_table["p-value (łącznie, n=180)"] < 0.05, "✅", "—"
+)
+st.dataframe(dm_table, use_container_width=True)
 
 if mock_mode:
     st.caption(

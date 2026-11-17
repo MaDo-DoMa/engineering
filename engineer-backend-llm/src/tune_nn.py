@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 import copy
-from config import ARTIFACTS_DIR
+from config import ARTIFACTS_DIR, RANDOM_SEED
 from models import LSTMPredictor, GRUPredictor
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -79,7 +79,11 @@ def objective(trial, model_type, X_train, y_train, X_val, y_val):
 def tune_and_save_nn(model_type, X_train, y_train, X_val, y_val, n_trials=10, ticker=None):
     print(f"\n--- Starting Optuna Optimization for {model_type} ---")
 
-    study = optuna.create_study(direction="minimize")
+    # Seeded sampler: without it the trial sequence (and thus the saved
+    # artifacts) would not be reproducible.
+    study = optuna.create_study(
+        direction="minimize", sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED)
+    )
     study.optimize(lambda trial: objective(trial, model_type, X_train, y_train, X_val, y_val), n_trials=n_trials)
 
     print(f"\nOptimization for {model_type} finished!")

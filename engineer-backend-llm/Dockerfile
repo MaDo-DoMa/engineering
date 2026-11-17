@@ -12,8 +12,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir -r requirements.txt
 # torch (required to serve the LSTM/GRU checkpoints) from the CPU-only wheel
 # index - considerably smaller than the default PyPI CUDA-bundled wheel.
+# Version pinned for reproducibility (retraining + checkpoint loading).
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+    pip install --no-cache-dir torch==2.15.0+cpu --index-url https://download.pytorch.org/whl/cpu
 
 COPY . .
 
